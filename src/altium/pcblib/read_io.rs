@@ -72,6 +72,7 @@ impl PcbLib {
     }
 
     /// The body of [`Self::read`], run under the library's ANSI encoding.
+    #[allow(clippy::too_many_lines)] // the library read, pass by pass
     fn read_scoped<R: std::io::Read + std::io::Seek>(
         mut cfb: cfb::CompoundFile<R>,
         code_page: Option<u32>,
@@ -106,6 +107,12 @@ impl PcbLib {
             // Skip non-storage entries and root
             let path_str = entry_path.to_string_lossy();
             if path_str == "/" || path_str.is_empty() {
+                continue;
+            }
+            // A footprint is a storage at the root. A footprint's own
+            // sub-storages also hold a Data stream (`PrimitiveGuids`,
+            // `ExtendedPrimitiveInformation`, …) and are never footprints.
+            if entry_path.parent() != Some(std::path::Path::new("/")) {
                 continue;
             }
 
@@ -212,6 +219,10 @@ impl PcbLib {
         // Populate model_3d from component_bodies for backward compatibility
         library.populate_model_3d_from_component_bodies();
 
+        // Keep each footprint's storage as read, beside the footprint as it
+        // was parsed, so an untouched footprint is written back verbatim.
+        Self::attach_storages_as_read(&mut cfb, &mut library.footprints);
+
         // The table this crate would build for the footprints as read: while
         // they still build it, Altium's own table is replayed (see
         // `LibraryMetadata::component_params_toc`).
@@ -223,6 +234,47 @@ impl PcbLib {
         tracing::info!(count = library.footprints.len(), "Read PcbLib");
 
         Ok(library)
+    }
+
+    /// Gives every footprint its storage as read (see
+    /// [`Footprint::storage_as_read`]): each stream under the storage, by its
+    /// path inside it, beside the footprint as it was parsed.
+    fn attach_storages_as_read<R: std::io::Read + std::io::Seek>(
+        cfb: &mut cfb::CompoundFile<R>,
+        footprints: &mut [Footprint],
+    ) {
+        for footprint in footprints {
+            let Some(storage) = footprint.storage_name.clone() else {
+                continue;
+            };
+            let root = std::path::Path::new("/").join(&storage);
+            let paths: Vec<std::path::PathBuf> = match cfb.walk_storage(&root) {
+                Ok(walk) => walk
+                    .filter(cfb::Entry::is_stream)
+                    .map(|entry| entry.path().to_path_buf())
+                    .collect(),
+                Err(_) => continue,
+            };
+            let mut streams = Vec::with_capacity(paths.len());
+            for path in paths {
+                let Ok(relative) = path.strip_prefix(&root) else {
+                    continue;
+                };
+                let Some(bytes) = crate::altium::read_stream_opt(cfb, &path) else {
+                    continue;
+                };
+                let relative = relative
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                streams.push((relative, bytes));
+            }
+            footprint.storage_as_read = Some(std::sync::Arc::new(super::StorageAsRead {
+                streams,
+                parsed: footprint.clone(),
+            }));
+        }
     }
 
     /// Populates `model_3d` field from `component_bodies` for backward compatibility.

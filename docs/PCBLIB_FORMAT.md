@@ -47,10 +47,14 @@ PcbLib files are OLE Compound Documents (CFB format, **OLE v3 with 512-byte sect
 > pad and via templates), `Textures`, `ModelsNoEmbed` and `FileVersionInfo` back byte for byte,
 > every stream of each storage included, and its `ComponentParamsTOC` — a per-footprint summary,
 > `Name|Pad Count|Height|Description`, with Unicode twins appended — back as read while the
-> footprints still match it; once one changes the table is rebuilt, in the library's code page. A
-> library built in memory gets Altium's empty defaults. In the test fixtures and the two reference
-> corpora, every stream of every Altium-authored library comes back exactly as read, compressed
-> models included, but for the save's path, date and time in `Library/Data`.
+> footprints still match it; once one changes the table is rebuilt, in the library's code page,
+> keeping the line Altium wrote for every unchanged footprint and giving any other its height in
+> mils (`39.3701`). A footprint unchanged since it was read goes back byte for byte, every stream
+> of its storage included — the ones this crate does not model, such as
+> `ExtendedPrimitiveInformation`, as well; an edited one is rebuilt and still carries those as
+> read. A library built in memory gets Altium's empty defaults. In the test fixtures and the two
+> reference corpora, every stream of every Altium-authored library comes back exactly as read,
+> compressed models included, but for the save's path, date and time in `Library/Data`.
 
 ## SectionKeys Stream
 
@@ -1174,6 +1178,8 @@ There is **no** end marker after the last primitive (issue #68).
 - **Default stack mode**: unknown stack mode IDs default to Simple (0)
 - **Internal OLE entries filtered on read**: FileHeader, Library, Models, Textures, ModelsNoEmbed, PadViaLibrary, LayerKindMapping,
     ComponentParamsTOC, FileVersionInfo, PrimitiveGuids
+- **Footprints are root storages only**: a footprint's own sub-storages (`PrimitiveGuids`,
+    `UniqueIDPrimitiveInformation`, `ExtendedPrimitiveInformation`, …) also hold a `Data` stream and are never footprints
 
 ## References
 

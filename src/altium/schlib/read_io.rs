@@ -155,7 +155,44 @@ impl SchLib {
         lib.section_keys_basis = Self::section_keys_stream(&symbols, &ole_names);
         lib.section_keys_read = crate::altium::read_stream_opt(&mut cfb, "/SectionKeys");
 
+        // Keep each symbol's storage as read, beside the symbol as it was
+        // parsed, so an untouched symbol is written back verbatim.
+        attach_storages_as_read(&mut cfb, lib.symbols.values_mut());
+
         Ok(lib)
+    }
+}
+
+/// Gives every symbol its storage as read (see [`Symbol::storage_as_read`]):
+/// each stream of the storage, beside the symbol as it was parsed.
+fn attach_storages_as_read<'a, R: Read + Seek>(
+    cfb: &mut cfb::CompoundFile<R>,
+    symbols: impl Iterator<Item = &'a mut Symbol>,
+) {
+    for symbol in symbols {
+        let Some(storage) = symbol.storage_name.clone() else {
+            continue;
+        };
+        let root = std::path::Path::new("/").join(&storage);
+        let names: Vec<String> = match cfb.read_storage(&root) {
+            Ok(entries) => entries
+                .filter(cfb::Entry::is_stream)
+                .map(|entry| entry.name().to_string())
+                .collect(),
+            Err(_) => continue,
+        };
+        let streams: Vec<(String, Vec<u8>)> = names
+            .into_iter()
+            .filter_map(|name| {
+                let bytes = crate::altium::read_stream_opt(cfb, root.join(&name))?;
+                Some((name, bytes))
+            })
+            .collect();
+        let parsed = symbol.fingerprint();
+        symbol.storage_as_read = Some(std::sync::Arc::new(super::SymbolStorageAsRead {
+            streams,
+            parsed,
+        }));
     }
 }
 

@@ -3,7 +3,8 @@
 //! Split out of `mod.rs` for navigability; same `impl PcbLib`.
 
 use super::{
-    writer, AltiumError, AltiumResult, ComponentBody, EmbeddedModel, Footprint, Layer, PcbLib,
+    writer, AltiumError, AltiumResult, ComponentBody, EmbeddedModel, Footprint, Layer, Model3D,
+    PcbLib,
 };
 
 impl PcbLib {
@@ -168,6 +169,7 @@ impl PcbLib {
     /// # Errors
     ///
     /// Returns an error if a STEP file cannot be read.
+    #[allow(clippy::too_many_lines)] // one decision per model_3d case, kept together
     fn prepare_3d_models_for_writing(&mut self) -> AltiumResult<()> {
         use uuid::Uuid;
 
@@ -190,6 +192,22 @@ impl PcbLib {
             // when reading a ComponentBody back) does not.
             let is_explicit_path = path.parent().is_some_and(|p| !p.as_os_str().is_empty());
             let file_present = path.exists() && path.is_file();
+
+            if file_present
+                && Self::embed_into_supplied_body(
+                    path,
+                    model_3d,
+                    &mut footprint.component_bodies,
+                    &mut self.models,
+                )?
+            {
+                tracing::debug!(
+                    footprint = %footprint.name,
+                    model = %display_name,
+                    "Embedded model_3d into the caller's ComponentBody"
+                );
+                continue;
+            }
 
             match (has_bodies, is_explicit_path, file_present) {
                 // New footprint whose STEP file is missing — the path is required.
@@ -299,6 +317,49 @@ impl PcbLib {
     /// - Truncates longer names and adds unique suffixes to avoid collisions
     ///
     /// The full footprint name is still stored in the PATTERN field.
+    /// Embeds the STEP file at `path` into a body the caller supplied for it —
+    /// one naming the file but referencing no model the library holds yet —
+    /// and reports whether there was one. Its layer, heights, outline and
+    /// placement are what the caller asked for, so it is bound to the new model
+    /// rather than replaced by a default body.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the STEP file cannot be read.
+    fn embed_into_supplied_body(
+        path: &std::path::Path,
+        model_3d: &Model3D,
+        bodies: &mut [ComponentBody],
+        models: &mut Vec<EmbeddedModel>,
+    ) -> AltiumResult<bool> {
+        let filename = path.file_name().map_or_else(
+            || "model.step".to_string(),
+            |n| n.to_string_lossy().to_string(),
+        );
+        let Some(body) = bodies.iter_mut().find(|cb| {
+            cb.model_name.eq_ignore_ascii_case(&filename)
+                && !models
+                    .iter()
+                    .any(|m| m.id.eq_ignore_ascii_case(&cb.model_id))
+        }) else {
+            return Ok(false);
+        };
+        let step_data = std::fs::read(path).map_err(|e| AltiumError::file_read(path, e))?;
+        let guid = format!("{{{}}}", uuid::Uuid::new_v4().to_string().to_uppercase());
+        models.push(EmbeddedModel::new(&guid, &filename, step_data));
+        body.model_id = guid;
+        body.model_name = filename;
+        body.embedded = true;
+        body.model_checksum = 0; // Fresh embed; Altium computes it on save.
+        if body.rotation_z == 0.0 {
+            body.rotation_z = model_3d.rotation;
+        }
+        if body.z_offset == 0.0 {
+            body.z_offset = model_3d.z_offset;
+        }
+        Ok(true)
+    }
+
     /// Drops a footprint's embedded bodies and the models they referenced,
     /// ahead of a re-embed from a new explicit path — otherwise the old models
     /// linger in `self.models` as orphans and bloat the library on every save.
@@ -534,25 +595,52 @@ impl PcbLib {
 
     /// The `/Library/ComponentParamsTOC/Data` stream this crate builds: one
     /// CRLF-terminated line per footprint, in the library's ANSI code page.
+    ///
+    /// A footprint unchanged since it was read keeps the line Altium wrote for
+    /// it (its Unicode twins and code page included); any other gets a line
+    /// built here, its height in mils as Altium prints it (`39.3701`).
     pub(crate) fn component_params_toc_stream(&self) -> Vec<u8> {
-        use std::fmt::Write as _;
-
-        let mut toc = String::new();
+        let read_lines = self.read_toc_lines();
+        let mut toc = Vec::new();
         for fp in &self.footprints {
-            let _ = write!(
-                toc,
-                "Name={}|Pad Count={}|Height=0|Description={}\r\n",
-                fp.name,
-                fp.pads.len(),
-                fp.description
-            );
+            let kept = fp.unchanged_storage().and_then(|_| {
+                read_lines.get(&crate::altium::encode_ansi(&fp.name, self.ansi_encoding()))
+            });
+            if let Some(line) = kept {
+                toc.extend_from_slice(line);
+            } else {
+                let line = format!(
+                    "Name={}|Pad Count={}|Height={}|Description={}",
+                    fp.name,
+                    fp.pads.len(),
+                    toc_height_mils(fp.height),
+                    fp.description
+                );
+                toc.extend_from_slice(&crate::altium::encode_ansi(&line, self.ansi_encoding()));
+            }
+            toc.extend_from_slice(b"\r\n");
         }
         let mut stream = Vec::new();
-        crate::altium::framing::write_cstring_param_block(
-            &mut stream,
-            &crate::altium::encode_ansi(&toc, self.ansi_encoding()),
-        );
+        crate::altium::framing::write_cstring_param_block(&mut stream, &toc);
         stream
+    }
+
+    /// The lines of the `ComponentParamsTOC` read with the library, by the
+    /// `Name=` bytes each starts with.
+    fn read_toc_lines(&self) -> std::collections::HashMap<Vec<u8>, Vec<u8>> {
+        let Some((read, _)) = &self.metadata.component_params_toc else {
+            return std::collections::HashMap::new();
+        };
+        let body = read.get(4..).unwrap_or_default();
+        let body = body.strip_suffix(b"\0").unwrap_or(body);
+        body.split(|&b| b == b'\n')
+            .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+            .filter_map(|line| {
+                let name = line.strip_prefix(b"Name=")?;
+                let end = name.iter().position(|&b| b == b'|').unwrap_or(name.len());
+                Some((name[..end].to_vec(), line.to_vec()))
+            })
+            .collect()
     }
 
     /// Writes the `/Library` metadata storages that Altium emits for every
@@ -768,6 +856,27 @@ impl PcbLib {
         // Create storage for the footprint
         crate::altium::create_storage(cfb, &storage_path)?;
 
+        // A footprint unchanged since it was read goes back as Altium wrote
+        // it: every stream of its storage, modelled or not, byte for byte.
+        if let Some(read) = footprint.unchanged_storage() {
+            for (relative, bytes) in &read.streams {
+                Self::write_carried_stream(cfb, &storage_path, relative, bytes)?;
+            }
+            return Ok(());
+        }
+
+        // An edited footprint is rebuilt below; the entries of its storage
+        // this crate does not model still go back as read rather than being
+        // dropped.
+        for (relative, bytes) in footprint.unmodelled_streams() {
+            tracing::debug!(
+                footprint = %footprint.name,
+                stream = %relative,
+                "Carrying an unmodelled footprint stream as read"
+            );
+            Self::write_carried_stream(cfb, &storage_path, relative, bytes)?;
+        }
+
         // Write Header stream (4-byte primitive count)
         let header_data = writer::encode_component_header(footprint);
         crate::altium::write_stream(cfb, &format!("{storage_path}/Header"), &header_data)?;
@@ -848,6 +957,28 @@ impl PcbLib {
         Ok(())
     }
 
+    /// Writes one stream of a footprint storage as read, creating the
+    /// sub-storages its path runs through.
+    fn write_carried_stream<F: std::io::Read + std::io::Write + std::io::Seek>(
+        cfb: &mut cfb::CompoundFile<F>,
+        storage_path: &str,
+        relative: &str,
+        bytes: &[u8],
+    ) -> AltiumResult<()> {
+        let mut parent = storage_path.to_string();
+        let mut parts: Vec<&str> = relative.split('/').filter(|p| !p.is_empty()).collect();
+        let Some(stream) = parts.pop() else {
+            return Ok(());
+        };
+        for part in parts {
+            parent = format!("{parent}/{part}");
+            if !cfb.is_storage(&parent) {
+                crate::altium::create_storage(cfb, &parent)?;
+            }
+        }
+        crate::altium::write_stream(cfb, &format!("{parent}/{stream}"), bytes)
+    }
+
     /// Encodes footprint primitives to binary format.
     ///
     /// See the [`writer`] module for format details.
@@ -857,6 +988,19 @@ impl PcbLib {
     /// Returns an error if any string (footprint name, pad designator, text) exceeds 255 bytes.
     fn encode_primitives(footprint: &Footprint) -> AltiumResult<Vec<u8>> {
         writer::encode_data_stream(footprint)
+    }
+}
+
+/// A footprint height (mm) as `ComponentParamsTOC` prints it: mils to four
+/// decimals with trailing zeros dropped (`1.0` → `39.3701`, `0.6` → `23.622`,
+/// `0.0` → `0`).
+fn toc_height_mils(height_mm: f64) -> String {
+    let text = format!("{:.4}", height_mm / 0.0254);
+    let text = text.trim_end_matches('0').trim_end_matches('.');
+    if text.is_empty() || text == "-0" {
+        "0".to_string()
+    } else {
+        text.to_string()
     }
 }
 
@@ -1168,5 +1312,180 @@ mod tests {
         lib.add(fp);
         assert_eq!(lib.ansi_encoding(), encoding_rs::GBK);
         assert_eq!(PcbLib::new().ansi_encoding(), encoding_rs::WINDOWS_1252);
+    }
+
+    /// Every stream under `/{storage}`, by its path inside the storage.
+    fn storage_streams(path: &std::path::Path, storage: &str) -> Vec<(String, Vec<u8>)> {
+        use std::io::Read as _;
+        let mut cfb = cfb::open(path).expect("open compound document");
+        let root = format!("/{storage}");
+        // Collected first: the walk borrows the file that each stream is
+        // then opened from.
+        #[allow(clippy::needless_collect)]
+        let paths: Vec<String> = cfb
+            .walk_storage(&root)
+            .expect("walk storage")
+            .filter(cfb::Entry::is_stream)
+            .map(|e| e.path().to_string_lossy().into_owned())
+            .collect();
+        let mut streams: Vec<(String, Vec<u8>)> = paths
+            .into_iter()
+            .map(|p| {
+                let mut bytes = Vec::new();
+                cfb.open_stream(&p)
+                    .expect("open stream")
+                    .read_to_end(&mut bytes)
+                    .expect("read stream");
+                (p[root.len()..].to_string(), bytes)
+            })
+            .collect();
+        streams.sort();
+        streams
+    }
+
+    /// Two footprints saved by this crate, the first given a sub-storage it
+    /// does not model — as Altium gives some footprints an
+    /// `ExtendedPrimitiveInformation` storage with its own `Data` stream.
+    fn library_with_an_unmodelled_sub_storage(path: &std::path::Path) {
+        use std::io::Write as _;
+        let mut lib = PcbLib::new();
+        for name in ["KEEP", "EDIT"] {
+            let mut fp = Footprint::new(name);
+            fp.add_pad(Pad::smd("1", 0.0, 0.0, 1.0, 1.0));
+            lib.add(fp);
+        }
+        lib.save(path).expect("save");
+        let mut cfb = cfb::open_rw(path).expect("open for writing");
+        cfb.create_storage("/KEEP/ExtendedPrimitiveInformation")
+            .expect("create sub-storage");
+        for (stream, bytes) in [("Header", &b"\x01\x00\x00\x00"[..]), ("Data", b"EXTRA")] {
+            cfb.create_stream(format!("/KEEP/ExtendedPrimitiveInformation/{stream}"))
+                .expect("create stream")
+                .write_all(bytes)
+                .expect("write stream");
+        }
+        cfb.flush().expect("flush");
+    }
+
+    /// A footprint's own sub-storage is never read as a footprint, and an
+    /// untouched footprint goes back byte for byte — the sub-storage this
+    /// crate does not model included — when another one is edited.
+    #[test]
+    fn an_untouched_footprint_and_its_unmodelled_streams_survive_a_rewrite() {
+        let dir = temp_dir();
+        let path = dir.path().join("Carry.PcbLib");
+        library_with_an_unmodelled_sub_storage(&path);
+        let before = storage_streams(&path, "KEEP");
+        assert!(before
+            .iter()
+            .any(|(p, _)| p == "/ExtendedPrimitiveInformation/Data"));
+
+        let mut lib = PcbLib::open(&path).expect("open");
+        let names: Vec<&str> = lib.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["KEEP", "EDIT"], "a sub-storage is not a footprint");
+
+        let edit = lib.get_mut("EDIT").expect("EDIT");
+        edit.pads[0].width = 2.5;
+        lib.save(&path).expect("save");
+
+        assert_eq!(
+            storage_streams(&path, "KEEP"),
+            before,
+            "KEEP comes back verbatim"
+        );
+        let read = PcbLib::open(&path).expect("reopen");
+        let width = read.get("EDIT").expect("EDIT").pads[0].width;
+        assert!(
+            (width - 2.5).abs() < 1e-6,
+            "the edit is written, not the old storage"
+        );
+        assert_eq!(read.iter().count(), 2);
+    }
+
+    /// An edited footprint is rebuilt, and the sub-storage this crate does
+    /// not model still goes back as read rather than being dropped.
+    #[test]
+    fn an_edited_footprint_keeps_its_unmodelled_streams() {
+        let dir = temp_dir();
+        let path = dir.path().join("CarryEdited.PcbLib");
+        library_with_an_unmodelled_sub_storage(&path);
+
+        let mut lib = PcbLib::open(&path).expect("open");
+        lib.get_mut("KEEP").expect("KEEP").pads[0].height = 3.0;
+        lib.save(&path).expect("save");
+
+        let after = storage_streams(&path, "KEEP");
+        let extra = after
+            .iter()
+            .find(|(p, _)| p == "/ExtendedPrimitiveInformation/Data")
+            .map(|(_, b)| b.as_slice());
+        assert_eq!(extra, Some(&b"EXTRA"[..]));
+        let read = PcbLib::open(&path).expect("reopen");
+        assert!((read.get("KEEP").expect("KEEP").pads[0].height - 3.0).abs() < 1e-4);
+    }
+
+    /// `ComponentParamsTOC` gives a footprint its height in mils as Altium
+    /// prints it, not 0.
+    #[test]
+    fn the_component_params_toc_carries_the_footprint_height() {
+        let mut lib = PcbLib::new();
+        for (name, height) in [("ONE", 1.0), ("POINT6", 0.6), ("FLAT", 0.0)] {
+            let mut fp = Footprint::new(name);
+            fp.height = height;
+            fp.add_pad(Pad::smd("1", 0.0, 0.0, 1.0, 1.0));
+            lib.add(fp);
+        }
+        let toc = String::from_utf8_lossy(&lib.component_params_toc_stream()).into_owned();
+        assert!(
+            toc.contains("Name=ONE|Pad Count=1|Height=39.3701|"),
+            "{toc}"
+        );
+        assert!(
+            toc.contains("Name=POINT6|Pad Count=1|Height=23.622|"),
+            "{toc}"
+        );
+        assert!(toc.contains("Name=FLAT|Pad Count=1|Height=0|"), "{toc}");
+    }
+
+    /// A body supplied beside a STEP model to embed is the body the model is
+    /// embedded into: its layer, height and outline are kept, not replaced by
+    /// a default body.
+    #[test]
+    fn a_supplied_body_receives_the_embedded_step_model() {
+        use crate::altium::pcblib::{ComponentBody, Layer, Model3D};
+        let dir = temp_dir();
+        let step = dir.path().join("BODY.step");
+        std::fs::write(&step, b"ISO-10303-21;\nEND-ISO-10303-21;\n").expect("write step");
+        let path = dir.path().join("Body.PcbLib");
+
+        let mut fp = Footprint::new("WITH_BODY");
+        fp.add_pad(Pad::smd("1", 0.0, 0.0, 1.0, 1.0));
+        let mut body = ComponentBody::new("", "BODY.step");
+        body.layer = Layer::Mechanical13;
+        body.overall_height = 1.0;
+        body.outline = vec![(-1.75, -1.75), (1.75, -1.75), (1.75, 1.75), (-1.75, 1.75)];
+        fp.component_bodies.push(body);
+        fp.model_3d = Some(Model3D {
+            filepath: step.to_string_lossy().into_owned(),
+            x_offset: 0.0,
+            y_offset: 0.0,
+            z_offset: 0.0,
+            rotation: 0.0,
+        });
+        let mut lib = PcbLib::new();
+        lib.add(fp);
+        lib.save(&path).expect("save");
+
+        let read = PcbLib::open(&path).expect("reopen");
+        let bodies = &read.get("WITH_BODY").expect("footprint").component_bodies;
+        assert_eq!(bodies.len(), 1, "no second, default body");
+        let body = &bodies[0];
+        assert_eq!(body.layer, Layer::Mechanical13);
+        assert!((body.overall_height - 1.0).abs() < 1e-4);
+        assert_eq!(body.outline.len(), 4);
+        assert!(body.embedded);
+        assert!(read
+            .models()
+            .any(|m| m.id.eq_ignore_ascii_case(&body.model_id)));
     }
 }

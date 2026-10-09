@@ -500,6 +500,46 @@ pub struct Symbol {
     /// [`SchPrimitiveKind::WRITE_ORDER`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub primitive_order: Vec<SchPrimitiveKind>,
+
+    /// The symbol's whole storage exactly as read, beside the symbol as it
+    /// was parsed from it. While the symbol still serialises the same, a
+    /// rewrite puts the storage back byte for byte — record order, key order
+    /// and spelling as Altium wrote them. `None` for a symbol built from
+    /// scratch.
+    #[serde(skip)]
+    pub storage_as_read: Option<std::sync::Arc<SymbolStorageAsRead>>,
+}
+
+/// A symbol's storage as read (see [`Symbol::storage_as_read`]).
+#[derive(Clone)]
+pub struct SymbolStorageAsRead {
+    /// Every stream of the storage, by name (`Data`, `PinWideText`, …).
+    pub streams: Vec<(String, Vec<u8>)>,
+    /// The symbol as parsed from these streams, serialised.
+    pub parsed: String,
+}
+
+impl std::fmt::Debug for SymbolStorageAsRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let streams: Vec<_> = self.streams.iter().map(|(p, b)| (p, b.len())).collect();
+        f.debug_struct("SymbolStorageAsRead")
+            .field("streams", &streams)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Symbol {
+    /// The symbol serialised for comparison with its parse.
+    pub(crate) fn fingerprint(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    /// The storage as read, when the symbol has not changed since: the
+    /// storage can then be written back verbatim.
+    pub(crate) fn unchanged_storage(&self) -> Option<&SymbolStorageAsRead> {
+        let read = self.storage_as_read.as_deref()?;
+        (!read.parsed.is_empty() && self.fingerprint() == read.parsed).then_some(read)
+    }
 }
 
 primitive_kinds! {

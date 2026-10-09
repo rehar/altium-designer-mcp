@@ -215,6 +215,72 @@ pub struct Footprint {
     /// `None` for a footprint built from scratch or without the stream.
     #[serde(skip)]
     pub primitive_guids_as_read: Option<Vec<u8>>,
+
+    /// The footprint's whole storage exactly as read, beside the footprint as
+    /// it was parsed from it. While the footprint still equals that parse, a
+    /// rewrite puts the storage back byte for byte — the streams this crate
+    /// models and the ones it does not (`ExtendedPrimitiveInformation`, or
+    /// whatever a newer Altium adds). Once it changes, the modelled streams
+    /// are rebuilt and the unmodelled ones still go back as read. `None` for a
+    /// footprint built from scratch.
+    #[serde(skip)]
+    pub storage_as_read: Option<std::sync::Arc<StorageAsRead>>,
+}
+
+/// A footprint's storage as read (see [`Footprint::storage_as_read`]).
+#[derive(Clone, PartialEq)]
+pub struct StorageAsRead {
+    /// Every stream of the storage, by its path inside the storage
+    /// (`Data`, `PrimitiveGuids/Data`, …), in the order they were found.
+    pub streams: Vec<(String, Vec<u8>)>,
+    /// The footprint as parsed from these streams, without its carriers.
+    pub parsed: Footprint,
+}
+
+impl std::fmt::Debug for StorageAsRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let streams: Vec<_> = self.streams.iter().map(|(p, b)| (p, b.len())).collect();
+        f.debug_struct("StorageAsRead")
+            .field("streams", &streams)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The entries of a footprint storage this crate reads and writes; any other
+/// entry of the storage is carried as read.
+pub(crate) const MODELLED_FOOTPRINT_ENTRIES: &[&str] = &[
+    "Header",
+    "Parameters",
+    "Data",
+    "WideStrings",
+    "PrimitiveGuids",
+    "UniqueIDPrimitiveInformation",
+];
+
+impl Footprint {
+    /// The storage as read, when the footprint has not changed since: the
+    /// storage can then be written back verbatim.
+    pub(crate) fn unchanged_storage(&self) -> Option<&StorageAsRead> {
+        let read = self.storage_as_read.as_deref()?;
+        let mut current = self.clone();
+        current.storage_as_read = None;
+        (current == read.parsed).then_some(read)
+    }
+
+    /// The streams of the storage as read that this crate does not model,
+    /// carried through the rewrite of an edited footprint.
+    pub(crate) fn unmodelled_streams(&self) -> impl Iterator<Item = &(String, Vec<u8>)> {
+        self.storage_as_read
+            .as_deref()
+            .into_iter()
+            .flat_map(|read| read.streams.iter())
+            .filter(|(path, _)| {
+                let first = path.split('/').next().unwrap_or_default();
+                !MODELLED_FOOTPRINT_ENTRIES
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(first))
+            })
+    }
 }
 
 /// How many primitives of each kind [`Footprint::move_layer`] moved.
@@ -453,6 +519,7 @@ impl Footprint {
             param_key_order: Vec::new(),
             primitive_order: Vec::new(),
             primitive_guids_as_read: None,
+            storage_as_read: None,
         }
     }
 

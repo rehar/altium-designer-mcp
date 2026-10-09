@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A footprint's own sub-storages are no longer read as footprints.** The library walk took
+  any storage holding a `Data` stream for a footprint, so a footprint's
+  `ExtendedPrimitiveInformation` storage was listed as an empty footprint of that name and
+  written back at the library root, while the footprint it belonged to lost it. Only
+  storages at the root are footprints now.
+- **An untouched footprint or symbol comes back byte for byte.** Every write rebuilt every
+  component from its parse, so one edit re-encoded the whole library: pad records of
+  footprints nobody touched changed (a corner radius of 17 % became 50 %, a rounded
+  rectangle at 100 % became round), symbols' records changed order, `ModelDatafileKind0=PCBLIB`
+  became `PCBLib`, and streams this crate does not model were dropped. A component keeps its
+  storage as read and, while it still equals its parse, goes back verbatim; an edited
+  footprint is rebuilt and still carries the entries this crate does not model.
+- **`ComponentParamsTOC` keeps every footprint's height.** The table was rebuilt with
+  `Height=0` for every footprint once any one changed. An unchanged footprint keeps the line
+  Altium wrote; any other is given its height in mils as Altium prints it (`39.3701`).
+- **A body supplied with a STEP model to embed is the body it is embedded into.** Passing
+  `step_model` beside `component_bodies` dropped the supplied body and added a default one on
+  `Top 3D Body` with no height and an outline from the pads. A supplied body that names the
+  STEP file and references no model yet now receives the model, keeping its layer, heights,
+  outline and placement.
+
 ## [1.2.0] - 2026-10-03
 
 A fidelity release: a library Altium wrote now comes back from a rewrite byte for byte.

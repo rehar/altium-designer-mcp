@@ -49,9 +49,18 @@ impl SchLib {
             .unwrap_or_else(crate::util::generate_unique_id);
         // Every symbol's Data stream, encoded first: the header's Weight is
         // their record count plus one.
+        // A symbol unchanged since it was read keeps the Data Altium wrote.
         let datas = symbols
             .iter()
-            .map(|symbol| writer::encode_data_stream(symbol))
+            .map(|symbol| {
+                let read_data = symbol.unchanged_storage().and_then(|read| {
+                    read.streams
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case("Data"))
+                        .map(|(_, bytes)| bytes.clone())
+                });
+                read_data.map_or_else(|| writer::encode_data_stream(symbol), Ok)
+            })
             .collect::<AltiumResult<Vec<_>>>()?;
         let weight = datas
             .iter()
@@ -94,6 +103,15 @@ impl SchLib {
         // One Data stream per symbol, under its own storage.
         for ((symbol, ole_name), data) in symbols.iter().zip(ole_names.iter()).zip(&datas) {
             crate::altium::create_storage(&mut cfb, &format!("/{ole_name}"))?;
+
+            // An unchanged symbol's storage goes back as Altium wrote it.
+            if let Some(read) = symbol.unchanged_storage() {
+                for (name, bytes) in &read.streams {
+                    crate::altium::write_stream(&mut cfb, &format!("/{ole_name}/{name}"), bytes)?;
+                }
+                continue;
+            }
+
             crate::altium::write_stream(&mut cfb, &format!("/{ole_name}/Data"), data)?;
 
             // Optional per-component pin auxiliary streams, written into the same
@@ -202,5 +220,82 @@ impl SchLib {
             })
             .collect();
         storage::encode_icon_storage(&entries)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read as _, Write as _};
+
+    use crate::altium::schlib::{Pin, PinOrientation, SchLib, Symbol};
+
+    fn temp_dir() -> tempfile::TempDir {
+        std::fs::create_dir_all(".tmp").expect("create .tmp");
+        let root = std::path::Path::new(".tmp")
+            .canonicalize()
+            .expect("canonicalise .tmp");
+        tempfile::tempdir_in(root).expect("create temp dir")
+    }
+
+    fn data_stream(path: &std::path::Path, symbol: &str) -> Vec<u8> {
+        let mut cfb = cfb::open(path).expect("open compound document");
+        let mut bytes = Vec::new();
+        cfb.open_stream(format!("/{symbol}/Data"))
+            .expect("open Data")
+            .read_to_end(&mut bytes)
+            .expect("read Data");
+        bytes
+    }
+
+    /// An untouched symbol goes back as Altium wrote it — here a header
+    /// record whose keys stand in an order this crate would not write —
+    /// while an edited one is rebuilt with the edit.
+    #[test]
+    fn an_untouched_symbol_comes_back_byte_for_byte() {
+        let dir = temp_dir();
+        let path = dir.path().join("Carry.SchLib");
+        let mut lib = SchLib::new();
+        for name in ["KEEP", "EDIT"] {
+            let mut symbol = Symbol::new(name);
+            symbol.add_pin(Pin::new("A", "1", -10, 0, 10, PinOrientation::Left));
+            lib.add(symbol);
+        }
+        lib.save(&path).expect("save");
+
+        // Swap two keys of KEEP's first record: same content, other bytes.
+        let mut data = data_stream(&path, "KEEP");
+        let text = String::from_utf8_lossy(&data[4..]).into_owned();
+        let record = text.split('\0').next().expect("first record").to_string();
+        let mut parts: Vec<&str> = record.split('|').collect();
+        let (a, b) = (
+            parts
+                .iter()
+                .position(|p| p.starts_with("PartCount="))
+                .expect("PartCount"),
+            parts
+                .iter()
+                .position(|p| p.starts_with("DisplayModeCount="))
+                .expect("DisplayModeCount"),
+        );
+        parts.swap(a, b);
+        let swapped = parts.join("|");
+        assert_eq!(swapped.len(), record.len());
+        data[4..4 + swapped.len()].copy_from_slice(swapped.as_bytes());
+        {
+            let mut cfb = cfb::open_rw(&path).expect("open for writing");
+            cfb.create_stream("/KEEP/Data")
+                .expect("replace Data")
+                .write_all(&data)
+                .expect("write Data");
+            cfb.flush().expect("flush");
+        }
+
+        let mut lib = SchLib::open(&path).expect("open");
+        lib.get_mut("EDIT").expect("EDIT").pins[0].name = "RENAMED".to_string();
+        lib.save(&path).expect("save");
+
+        assert_eq!(data_stream(&path, "KEEP"), data, "KEEP comes back verbatim");
+        let read = SchLib::open(&path).expect("reopen");
+        assert_eq!(read.get("EDIT").expect("EDIT").pins[0].name, "RENAMED");
     }
 }
